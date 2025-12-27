@@ -1,19 +1,24 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, ArrowRight, CheckCircle } from "lucide-react";
+import { ArrowLeft, ArrowRight, CheckCircle, LogIn } from "lucide-react";
 import { UserDetailsForm } from "./UserDetailsForm";
 import { QuestionnaireForm } from "./QuestionnaireForm";
 import { ImageUploadForm } from "./ImageUploadForm";
 import { ReportDisplay } from "./ReportDisplay";
-import { generateReport } from "@/lib/reportGenerator";
+import { useAuth } from "@/hooks/useAuth";
+import { useToast } from "@/hooks/use-toast";
+import { supabase } from "@/integrations/supabase/client";
+import { getOrCreateProfile, updateProfile } from "@/services/profileService";
+import { saveQuestionnaireResponse } from "@/services/questionnaireService";
+import { uploadImage, getImageUrl } from "@/services/imageService";
 import {
   AssessmentData,
   HairHealthReport,
   initialUserDetails,
   initialQuestionnaire,
 } from "@/types/assessment";
-import { useToast } from "@/hooks/use-toast";
 
 const steps = [
   { id: 1, title: "Your Details", description: "Basic information" },
@@ -24,6 +29,8 @@ const steps = [
 
 export function AssessmentSection() {
   const { toast } = useToast();
+  const { user, loading: authLoading } = useAuth();
+  const navigate = useNavigate();
   const [currentStep, setCurrentStep] = useState(1);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [report, setReport] = useState<HairHealthReport | null>(null);
@@ -37,11 +44,7 @@ export function AssessmentSection() {
     switch (step) {
       case 1:
         if (!data.userDetails.name || !data.userDetails.email || !data.userDetails.age || !data.userDetails.gender) {
-          toast({
-            title: "Missing information",
-            description: "Please fill in all required fields",
-            variant: "destructive",
-          });
+          toast({ title: "Missing information", description: "Please fill in all required fields", variant: "destructive" });
           return false;
         }
         return true;
@@ -49,16 +52,9 @@ export function AssessmentSection() {
         if (!data.questionnaire.hairFallSeverity || !data.questionnaire.familyHistory || 
             !data.questionnaire.stressLevel || !data.questionnaire.dietQuality || 
             !data.questionnaire.sleepDuration || !data.questionnaire.hairWashFrequency) {
-          toast({
-            title: "Missing answers",
-            description: "Please answer all questions",
-            variant: "destructive",
-          });
+          toast({ title: "Missing answers", description: "Please answer all questions", variant: "destructive" });
           return false;
         }
-        return true;
-      case 3:
-        // Images are optional but recommended
         return true;
       default:
         return true;
@@ -69,28 +65,69 @@ export function AssessmentSection() {
     if (!validateStep(currentStep)) return;
 
     if (currentStep === 3) {
-      // Generate report
+      if (!user) {
+        toast({ title: "Please sign in", description: "You need to be logged in to generate a report", variant: "destructive" });
+        return;
+      }
+
       setIsSubmitting(true);
-      await new Promise((resolve) => setTimeout(resolve, 1500)); // Simulate processing
-      const generatedReport = generateReport(data.questionnaire);
-      setReport(generatedReport);
-      setIsSubmitting(false);
-      setCurrentStep(4);
+      try {
+        // Get or create profile
+        const profile = await getOrCreateProfile(user.id, user.email || data.userDetails.email);
+        
+        // Update profile with user details
+        await updateProfile(user.id, data.userDetails);
+
+        // Save questionnaire
+        const questionnaireResponse = await saveQuestionnaireResponse(profile.id, data.questionnaire);
+
+        // Upload images and get URLs
+        const imageData = await Promise.all(
+          data.images.map(async (img) => {
+            const uploaded = await uploadImage(user.id, profile.id, img.file, img.label);
+            const url = await getImageUrl(uploaded.file_path);
+            return { label: img.label, url };
+          })
+        );
+
+        // Call edge function
+        const { data: result, error } = await supabase.functions.invoke("analyze-hair", {
+          body: {
+            profileId: profile.id,
+            questionnaireId: questionnaireResponse.id,
+            questionnaire: data.questionnaire,
+            userInfo: { age: parseInt(data.userDetails.age) || null, gender: data.userDetails.gender },
+            images: imageData,
+          },
+        });
+
+        if (error) throw error;
+
+        setReport({
+          overallRiskLevel: result.report.overallRiskLevel,
+          riskScore: result.report.riskScore,
+          possibleCauses: result.report.possibleCauses,
+          recommendations: result.report.recommendations,
+          lifestyleImpact: result.report.lifestyleImpact,
+          scalpHealthWarning: result.report.scalpHealthWarning,
+          generatedAt: new Date(result.report.generatedAt),
+        });
+        setCurrentStep(4);
+      } catch (error) {
+        console.error("Error generating report:", error);
+        toast({ title: "Error", description: "Failed to generate report. Please try again.", variant: "destructive" });
+      } finally {
+        setIsSubmitting(false);
+      }
     } else {
       setCurrentStep((prev) => prev + 1);
     }
   };
 
-  const handleBack = () => {
-    setCurrentStep((prev) => prev - 1);
-  };
+  const handleBack = () => setCurrentStep((prev) => prev - 1);
 
   const handleReset = () => {
-    setData({
-      userDetails: initialUserDetails,
-      questionnaire: initialQuestionnaire,
-      images: [],
-    });
+    setData({ userDetails: initialUserDetails, questionnaire: initialQuestionnaire, images: [] });
     setReport(null);
     setCurrentStep(1);
   };
@@ -98,21 +135,21 @@ export function AssessmentSection() {
   return (
     <section id="assessment" className="py-20 md:py-32 bg-secondary/30">
       <div className="container mx-auto px-4">
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.6 }}
-          className="text-center mb-12"
-        >
+        <motion.div initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} transition={{ duration: 0.6 }} className="text-center mb-12">
           <span className="text-primary font-semibold text-sm uppercase tracking-wider">Assessment</span>
-          <h2 className="text-3xl md:text-5xl font-bold text-foreground mt-2 mb-4">
-            Take the Hair Health Test
-          </h2>
-          <p className="text-muted-foreground text-lg max-w-2xl mx-auto">
-            Complete the assessment to receive your personalized hair health report
-          </p>
+          <h2 className="text-3xl md:text-5xl font-bold text-foreground mt-2 mb-4">Take the Hair Health Test</h2>
+          <p className="text-muted-foreground text-lg max-w-2xl mx-auto">Complete the assessment to receive your personalized hair health report</p>
         </motion.div>
+
+        {/* Auth prompt */}
+        {!authLoading && !user && currentStep < 4 && (
+          <div className="max-w-3xl mx-auto mb-6 bg-primary/10 border border-primary/20 rounded-xl p-4 flex items-center justify-between">
+            <p className="text-sm text-foreground">Sign in to save your progress and generate reports</p>
+            <Button variant="hero" size="sm" onClick={() => navigate("/auth")} className="gap-2">
+              <LogIn className="w-4 h-4" /> Sign In
+            </Button>
+          </div>
+        )}
 
         {/* Progress Steps */}
         {currentStep < 4 && (
@@ -121,28 +158,12 @@ export function AssessmentSection() {
               {steps.slice(0, 3).map((step, index) => (
                 <div key={step.id} className="flex items-center">
                   <div className="flex flex-col items-center">
-                    <div
-                      className={`w-10 h-10 rounded-full flex items-center justify-center font-semibold transition-all duration-300 ${
-                        currentStep > step.id
-                          ? "gradient-primary text-primary-foreground"
-                          : currentStep === step.id
-                          ? "border-2 border-primary text-primary"
-                          : "border-2 border-border text-muted-foreground"
-                      }`}
-                    >
+                    <div className={`w-10 h-10 rounded-full flex items-center justify-center font-semibold transition-all duration-300 ${currentStep > step.id ? "gradient-primary text-primary-foreground" : currentStep === step.id ? "border-2 border-primary text-primary" : "border-2 border-border text-muted-foreground"}`}>
                       {currentStep > step.id ? <CheckCircle className="w-5 h-5" /> : step.id}
                     </div>
-                    <span className="text-xs mt-2 text-muted-foreground hidden md:block">
-                      {step.title}
-                    </span>
+                    <span className="text-xs mt-2 text-muted-foreground hidden md:block">{step.title}</span>
                   </div>
-                  {index < 2 && (
-                    <div
-                      className={`w-16 md:w-24 lg:w-32 h-1 mx-2 rounded transition-all duration-300 ${
-                        currentStep > step.id ? "gradient-primary" : "bg-border"
-                      }`}
-                    />
-                  )}
+                  {index < 2 && <div className={`w-16 md:w-24 lg:w-32 h-1 mx-2 rounded transition-all duration-300 ${currentStep > step.id ? "gradient-primary" : "bg-border"}`} />}
                 </div>
               ))}
             </div>
@@ -152,68 +173,20 @@ export function AssessmentSection() {
         {/* Form Content */}
         <div className="max-w-3xl mx-auto bg-card rounded-2xl p-6 md:p-10 shadow-card border border-border/50">
           <AnimatePresence mode="wait">
-            {currentStep === 1 && (
-              <UserDetailsForm
-                key="step1"
-                data={data.userDetails}
-                onChange={(userDetails) => setData({ ...data, userDetails })}
-              />
-            )}
-            {currentStep === 2 && (
-              <QuestionnaireForm
-                key="step2"
-                data={data.questionnaire}
-                onChange={(questionnaire) => setData({ ...data, questionnaire })}
-              />
-            )}
-            {currentStep === 3 && (
-              <ImageUploadForm
-                key="step3"
-                images={data.images}
-                onChange={(images) => setData({ ...data, images })}
-              />
-            )}
-            {currentStep === 4 && report && (
-              <ReportDisplay
-                key="step4"
-                report={report}
-                images={data.images}
-                onReset={handleReset}
-              />
-            )}
+            {currentStep === 1 && <UserDetailsForm key="step1" data={data.userDetails} onChange={(userDetails) => setData({ ...data, userDetails })} />}
+            {currentStep === 2 && <QuestionnaireForm key="step2" data={data.questionnaire} onChange={(questionnaire) => setData({ ...data, questionnaire })} />}
+            {currentStep === 3 && <ImageUploadForm key="step3" images={data.images} onChange={(images) => setData({ ...data, images })} />}
+            {currentStep === 4 && report && <ReportDisplay key="step4" report={report} images={data.images} onReset={handleReset} />}
           </AnimatePresence>
 
-          {/* Navigation Buttons */}
+          {/* Navigation */}
           {currentStep < 4 && (
             <div className="flex items-center justify-between mt-8 pt-6 border-t border-border">
-              <Button
-                variant="ghost"
-                onClick={handleBack}
-                disabled={currentStep === 1}
-                className="gap-2"
-              >
-                <ArrowLeft className="w-4 h-4" />
-                Back
+              <Button variant="ghost" onClick={handleBack} disabled={currentStep === 1} className="gap-2">
+                <ArrowLeft className="w-4 h-4" /> Back
               </Button>
-              <Button
-                variant="hero"
-                onClick={handleNext}
-                disabled={isSubmitting}
-                className="gap-2"
-              >
-                {isSubmitting ? (
-                  "Generating Report..."
-                ) : currentStep === 3 ? (
-                  <>
-                    Generate Report
-                    <CheckCircle className="w-4 h-4" />
-                  </>
-                ) : (
-                  <>
-                    Next
-                    <ArrowRight className="w-4 h-4" />
-                  </>
-                )}
+              <Button variant="hero" onClick={handleNext} disabled={isSubmitting || (currentStep === 3 && !user)} className="gap-2">
+                {isSubmitting ? "Generating Report..." : currentStep === 3 ? (<>Generate Report <CheckCircle className="w-4 h-4" /></>) : (<>Next <ArrowRight className="w-4 h-4" /></>)}
               </Button>
             </div>
           )}
