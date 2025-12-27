@@ -1,1 +1,4 @@
 project_id = "qzeutqynkvbxkbrnsaaf"
+
+[functions.analyze-hair]
+verify_jwt = true
